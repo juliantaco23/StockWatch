@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "string.h": "c",
+        "hx711_multi.h": "c",
+        "lcd_i2c.h": "c"
+    }
+}
