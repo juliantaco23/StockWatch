@@ -31,7 +31,7 @@ static void lcd_send_byte(lcd_i2c_t *lcd, uint8_t val, int mode) {
 
 void lcd_init(lcd_i2c_t *lcd) {
     sleep_ms(50);  // Esperar a que el LCD se inicialice
-
+    lcd_set_backlight(lcd, 0);
     // Secuencia de inicialización
     lcd_send_byte(lcd, 0x03, LCD_COMMAND);
     lcd_send_byte(lcd, 0x03, LCD_COMMAND);

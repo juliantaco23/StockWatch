@@ -1,157 +1,197 @@
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "pico/stdlib.h"
+#include "hardware/i2c.h"
 #include "tusb.h"
 #include "include/common.h"
+#include "include/lcd_i2c.h"
+#include "include/keypad.h"
+#include "include/user_management.h"
+#include "hardware/uart.h"
+// Configuración de pines
+#define CLOCK_PIN 9
+#define DATA_PIN 10
+#define LED_STATUS 6
+#define LCD_SDA 4
+#define LCD_SCL 5
+#define LCD_ADDR 0x27
+#define UART_ID uart0
+#define BAUD_RATE 115200
+#define UART_TX_PIN 0
+#define UART_RX_PIN 1
+// Factor de calibración para la celda única (ajustar según calibración)
+#define SCALE_FACTOR -229.48f  
 
-// Configuración inicial
-#define CLOCK_PIN 16
-#define DATA_PIN 17
-#define SAMPLES_PER_READING 10
-static int32_t tare_offset = 0;
-static int32_t calibration_value = 0;
-static float known_weight = 4650.0f;  // Ajusta esto al peso que uses para calibrar (en gramos)
+// Estados del sistema
+typedef enum {
+    SYSTEM_IDLE,
+    WAITING_ID,
+    WAITING_PASSWORD,
+    SYSTEM_RUNNING
+} SystemState;
 
-// Función para obtener el promedio de varias lecturas
-int32_t get_average_reading(hx711_t *hx, int num_readings) {
-    int32_t sum = 0;
-    for (int i = 0; i < num_readings; i++) {
-        sum += hx711_get_value(hx);
-        sleep_ms(10);
-    }
-    return sum / num_readings;
-}
+void get_weight(hx711_t *hx, float scale_factor, float *weight);
+void process_keypad_input(char key, lcd_i2c_t *lcd);
+void update_display(lcd_i2c_t *lcd, float weight);
 
-// Función de tara ajustada
-void perform_tare(hx711_t *hx) {
-    printf("\nRealizando tara...\n");
-    printf("Asegúrate de que no haya peso en la balanza\n");
-    sleep_ms(2000);
-    
-    // Promedio de 10 lecturas para mayor estabilidad
-    int32_t sum = 0;
-    for(int i = 0; i < 10; i++) {
-        sum += hx711_get_value(hx);
-        sleep_ms(100);
-    }
-    tare_offset = sum / 10;
-    printf("Tara completada. Valor de offset: %li\n", tare_offset);
-}
+// Variables globales
+static SystemState currentState = SYSTEM_IDLE;
+static char input_buffer[10] = {0};
+static int buffer_pos = 0;
+static char current_id[7] = {0};
 
-// Función de calibración ajustada
-void calibrate(hx711_t *hx) {
-    printf("\nIniciando calibración...\n");
-    printf("Coloca el peso conocido de %.1f gramos\n", known_weight);
-    sleep_ms(3000);
-    
-    // Promedio de 10 lecturas con el peso conocido
-    int32_t sum = 0;
-    for(int i = 0; i < 10; i++) {
-        sum += hx711_get_value(hx);
-        sleep_ms(100);
-    }
-    calibration_value = sum / 10;
-    
-    printf("Calibración completada.\n");
-    printf("Valor sin peso: %li\n", tare_offset);
-    printf("Valor con peso: %li\n", calibration_value);
-}
-
-// Función para obtener el peso ajustada
-float get_weight(hx711_t *hx) {
-    // Promedio de 3 lecturas para estabilidad
-    int32_t sum = 0;
-    for(int i = 0; i < 3; i++) {
-        sum += hx711_get_value(hx);
-        sleep_ms(10);
-    }
-    int32_t value = sum / 3;
-    
-    // Fórmula de conversión ajustada
-    float weight = 0;
-    if(calibration_value != tare_offset) {
-        weight = ((float)(value - tare_offset) * known_weight) / 
-                (float)(calibration_value - tare_offset);
-    }
-    
-    return weight;
-}
-
-int main(void) {
+int main() {
     stdio_init_all();
     
     while (!tud_cdc_connected()) {
         sleep_ms(100);
     }
+    sleep_ms(1000);  // Dar tiempo adicional para que la conexión se establezca
+    printf("\nIniciando uart\n");
+    uart_init(UART_ID, BAUD_RATE);
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    printf("\nIniciando sistema de pesaje...\n");
     
-    printf("\nIniciando sistema de pesaje HX711...\n");
-    
-    // Configuración del HX711
+    // Configuración del HX711 para una sola celda
     hx711_config_t hxcfg;
     hx711_get_default_config(&hxcfg);
     hxcfg.clock_pin = CLOCK_PIN;
     hxcfg.data_pin = DATA_PIN;
     
     hx711_t hx;
-    
-    // Inicialización del HX711 como en el ejemplo original
     hx711_init(&hx, &hxcfg);
-    
-    // Encendido y configuración del HX711
     hx711_power_up(&hx, hx711_gain_128);
-    hx711_wait_settle(hx711_rate_80);
+    hx711_wait_settle(hx711_gain_128);
+    printf("HX711 inicializado\n");
     
-    printf("HX711 inicializado correctamente\n");
+    // Inicialización del LED de estado
+    gpio_init(LED_STATUS);
+    gpio_set_dir(LED_STATUS, GPIO_OUT);
+    gpio_put(LED_STATUS, 0); // Sistema inactivo inicialmente
     
-    // Menú principal
-    char cmd;
-    bool running = true;
+    // Inicialización del keypad
+    keypad_init();
     
-    while (running) {
-        printf("\n=== Menú de Calibración y Pesaje ===\n");
-        printf("t: Realizar tara (ajuste a cero)\n");
-        printf("c: Calibrar con peso conocido\n");
-        printf("p: Realizar pesaje\n");
-        printf("m: Monitoreo continuo\n");
-        printf("q: Salir\n");
-        printf("Seleccione una opción: ");
-        
-        cmd = getchar();
-        
-        switch (cmd) {
-            case 't':
-                perform_tare(&hx);
-                break;
-                
-            case 'c':
-                calibrate(&hx);
-                break;
-                
-            case 'p':
-                printf("\nPeso actual: %.2f g\n", get_weight(&hx));
-                break;
-                
-            case 'm':
-                printf("\nIniciando monitoreo continuo (presiona cualquier tecla para detener)...\n");
-                while (!getchar_timeout_us(1000)) {
-                    printf("Peso: %.2f g\r", get_weight(&hx));
-                    sleep_ms(200);
-                }
-                break;
-                
-            case 'q':
-                running = false;
-                break;
-                
-            default:
-                printf("\nOpción no válida\n");
-                break;
+    // Inicialización del sistema de usuarios
+    user_init();
+    
+    // Inicialización del LCD I2C
+    i2c_init(i2c0, 100 * 1000);
+    gpio_set_function(LCD_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(LCD_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(LCD_SDA);
+    gpio_pull_up(LCD_SCL);
+    lcd_i2c_t lcd = {
+        .i2c = i2c0,
+        .addr = LCD_ADDR
+    };
+    lcd_init(&lcd);
+    lcd_write_string(&lcd, "Ingrese ID:");
+
+    float weight = 0.0f;
+    while (true) {
+        char key = get_key();
+        if (key != '\0') {
+            printf("Tecla presionada: %c\n", key);
+            process_keypad_input(key, &lcd);
         }
+        
+        if (currentState == SYSTEM_RUNNING) {
+            get_weight(&hx, SCALE_FACTOR, &weight);
+            update_display(&lcd, weight);
+        }
+        
+        sleep_ms(100);
     }
     
-    // Limpieza y cierre
-    hx711_close(&hx);
-    printf("\nSistema finalizado\n");
+    return 0;
+}
+
+void get_weight(hx711_t *hx, float scale_factor, float *weight) {
+    int32_t raw_value = hx711_get_value(hx);
+    *weight = ((float)raw_value / scale_factor) - 300.0f;
+}
+
+void send_weight_uart(float weight) {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.1f\n", weight);
+    uart_puts(UART_ID, buffer);
+}
+
+void process_keypad_input(char key, lcd_i2c_t *lcd) {
+    switch (currentState) {
+        case SYSTEM_IDLE:
+        case WAITING_ID:
+            if (buffer_pos < 6 && key >= '0' && key <= '9') {
+                input_buffer[buffer_pos++] = key;
+                input_buffer[buffer_pos] = '\0';
+                lcd_set_cursor(lcd, 1, 0);
+                lcd_write_string(lcd, input_buffer);
+                
+                if (buffer_pos == 6) {
+                    strcpy(current_id, input_buffer);
+                    buffer_pos = 0;
+                    input_buffer[0] = '\0';
+                    currentState = WAITING_PASSWORD;
+                    lcd_clear(lcd);
+                    lcd_write_string(lcd, "Ingrese Clave:");
+                }
+            }
+            break;
+            
+        case WAITING_PASSWORD:
+            if (buffer_pos < 4 && key >= '0' && key <= '9') {
+                input_buffer[buffer_pos++] = key;
+                input_buffer[buffer_pos] = '\0';
+                lcd_set_cursor(lcd, 1, 0);
+                lcd_write_string(lcd, "****");
+            
+                if (buffer_pos == 4) {
+                    if (verify_user(current_id, input_buffer)) {
+                        currentState = SYSTEM_RUNNING;
+                        gpio_put(LED_STATUS, 1); // Sistema activo
+                        lcd_clear(lcd);
+                        lcd_write_string(lcd, "Sistema Activo");
+                    } else {
+                        currentState = SYSTEM_IDLE;
+                        buffer_pos = 0;
+                        lcd_clear(lcd);
+                        lcd_write_string(lcd, "Error! Reintente");
+                        sleep_ms(2000);
+                        lcd_clear(lcd);
+                        lcd_write_string(lcd, "Ingrese ID:");
+                    }
+                }
+            }  
+            break;
+            
+        case SYSTEM_RUNNING:
+            if (key == '*') {
+                currentState = SYSTEM_IDLE;
+                buffer_pos = 0;
+                gpio_put(LED_STATUS, 0); // Sistema inactivo
+                lcd_clear(lcd);
+                lcd_write_string(lcd, "Sistema Inactivo");
+                sleep_ms(2000);
+                lcd_clear(lcd);
+                lcd_write_string(lcd, "Ingrese ID:");
+            }
+            break;
+    }
+}
+
+void update_display(lcd_i2c_t *lcd, float weight) {
+    static uint32_t last_update = 0;
+    uint32_t current_time = to_ms_since_boot(get_absolute_time());
     
-    return EXIT_SUCCESS;
+    if (current_time - last_update >= 500) { // Actualizar cada 500 ms
+        char buffer[32];
+        lcd_clear(lcd);
+        snprintf(buffer, sizeof(buffer), "Peso: %.1f g", weight);
+        lcd_set_cursor(lcd, 0, 0);
+        lcd_write_string(lcd, buffer);
+        send_weight_uart(weight);
+        last_update = current_time;
+    }
 }

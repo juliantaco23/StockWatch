@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.13)
 
 include(pico_sdk_import.cmake)
 
-project(hx_lcd_matriz C CXX ASM)
+project(systnsingl C CXX ASM)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -11,7 +11,7 @@ pico_sdk_init()
 
 # Add main.c as the only source file
 add_executable(${PROJECT_NAME}
-    hx_lcd_matriz.c
+systnsingl.c
 )
 
 # Add include directory for the HX711 library headers
@@ -37,6 +37,7 @@ target_link_libraries(${PROJECT_NAME}
     hardware_dma
     hardware_gpio
     hardware_i2c
+    hardware_uart
 )
 
 # enable usb output, disable uart output
